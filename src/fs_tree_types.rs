@@ -11,7 +11,7 @@ use crate::metadata::FsMetadata;
 
 /// Define some concrete types for working with crdt_tree.
 
-pub type ActorType = u64;
+pub type ActorType = brb_membership::actor::ed25519::Actor;
 pub type TreeIdType = u64;
 pub type TreeMetaType = FsMetadata;
 

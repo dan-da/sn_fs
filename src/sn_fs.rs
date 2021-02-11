@@ -12,30 +12,13 @@ extern crate fuse;
 extern crate libc;
 extern crate time;
 
-/// sn_fs: A prototype FUSE filesystem that uses crdt_tree
-/// for storing directory structure metadata.
-///
-/// This prototype operates only as a local filesystem.
-/// The plan is to make it into a network filesystem
-/// utilizing the CRDT properties to ensure that replicas
-/// sync/converge correctly.
-///
-/// In this implementation the contents of each file are stored in
-/// a corresponding file in the underlying filesystem whose name
-/// is the inode identifier.  These inode content files are
-/// all located in the mountpoint directory and are deleted when
-/// sn_fs is unmounted.  Thus, they are never directly visible
-/// to other processes.
-///
-/// In a networked implementation, the above mechanism could be used
-/// as a method to implement a local cache.
 // Note: see for helpful description of inode fields and when/how to update them.
 // https://man7.org/linux/man-pages/man7/inode.7.html
-mod fs_tree_types;
-mod metadata;
 
+use fasthash::{farm::Hasher64, FastHasher};
 use log::{debug, error};
-use openat::{Dir, SimpleType};
+use openat::Dir;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -45,23 +28,23 @@ use fuse::{
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use libc::{mode_t, EEXIST, EINVAL, ENOENT, ENOTEMPTY};
-use std::env;
 use std::ffi::OsStr;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use time::Timespec; // unix specific.
 
-use fs_tree_types::{ActorType, FsOpMove, FsTreeNode, FsTreeReplica};
+use super::fs_tree_types::{ActorType, FsOpMove, FsTreeNode, FsTreeReplica};
 
-use metadata::{
+use super::metadata::{
     DirentKind, FsInodeCommon, FsInodeDirectory, FsInodeFile, FsInodeOs, FsInodePosix,
     FsInodeSymlink, FsMetadata, FsRefFile,
 };
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 }; // 1 second
 
-struct SnFs {
+/// Safe Network File System
+pub struct SnFs {
     replica: Arc<Mutex<FsTreeReplica>>,
     mountpoint: Dir,
 }
@@ -92,31 +75,36 @@ impl SnFs {
 
     const INO_FILE_PERM: mode_t = 0o600; // permissions for on-disk file-contents.
 
+    /// returns a new SnFs instance
     #[inline]
-    fn new(actor: ActorType, mountpoint: Dir) -> Self {
+    pub fn new(actor: ActorType, mountpoint: Dir) -> Self {
         Self {
             replica: Arc::new(Mutex::new(FsTreeReplica::new(actor))),
             mountpoint,
         }
     }
 
+    /// returns top-most tree node identifier
     #[inline]
-    fn forest() -> u64 {
+    pub fn forest() -> u64 {
         Self::FOREST
     }
 
+    /// returns filesystem root identifier
     #[inline]
-    fn root() -> u64 {
+    pub fn root() -> u64 {
         Self::ROOT
     }
 
+    /// returns inode root identifier
     #[inline]
-    fn fileinodes() -> u64 {
+    pub fn fileinodes() -> u64 {
         Self::FILEINODES
     }
 
+    /// returns trash identifier
     #[inline]
-    fn trash() -> u64 {
+    pub fn trash() -> u64 {
         Self::TRASH
     }
 
@@ -159,7 +147,10 @@ impl SnFs {
         metadata: FsMetadata,
     ) -> FsOpMove {
         let ts = replica.time().inc();
-        let child = InoMerge::combine(*ts.actor_id(), ts.counter());
+        let mut hasher = Hasher64::new();
+        (*ts.actor_id()).hash(&mut hasher);
+        let actor_hashed = hasher.finish();
+        let child = InoMerge::combine(actor_hashed, ts.counter());
         FsOpMove::new(ts, parent, metadata, child)
     }
 
@@ -1130,67 +1121,4 @@ impl Filesystem for SnFs {
             reply.error(ENOENT);
         }
     }
-}
-
-fn main() {
-    env_logger::builder().format_timestamp_nanos().init();
-    let mountpoint = match env::args_os().nth(1) {
-        Some(v) => v,
-        None => {
-            print_usage();
-            return;
-        }
-    };
-
-    // We use Dir::open() to get access to the mountpoint directory
-    // before the mount occurs.  This handle enables us to later create/write/read
-    // "real" files beneath the mountpoint even though other processes will only
-    // see the filesystem view that our SnFs provides.
-    let mountpoint_fd = match Dir::open(Path::new(&mountpoint)) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Unable to open {:?}.  {:?}", mountpoint, e);
-            return;
-        }
-    };
-
-    let actor = rand::random::<ActorType>();
-
-    // Notes:
-    //  1. todo: these options should come from command line.
-    //  2. allow_other enables other users to read/write.  Required for testing chown.
-    //  3. allow_other requires that `user_allow_other` is in /etc/fuse.conf.
-    //    let options = ["-o", "ro", "-o", "fsname=safefs"]    // -o ro = mount read only
-    let options = ["-o", "fsname=sn_fs"]
-        .iter()
-        .map(|o| o.as_ref())
-        .collect::<Vec<&OsStr>>();
-
-    // mount the filesystem.
-    if let Err(e) = fuse::mount(SnFs::new(actor, mountpoint_fd), &mountpoint, &options) {
-        eprintln!("Mount failed.  {:?}", e);
-        return;
-    }
-
-    // Delete all "real" files (each file representing content of 1 inode) under mount point.
-    // this code should be in SnFs::destroy(), but its not getting called.
-    // Seems like a fuse bug/issue.
-    let mountpoint_fd = Dir::open(Path::new(&mountpoint)).unwrap();
-    if let Ok(entries) = mountpoint_fd.list_dir(".") {
-        for result in entries {
-            if let Ok(entry) = result {
-                if entry.simple_type() == Some(SimpleType::File)
-                    && mountpoint_fd
-                        .remove_file(Path::new(entry.file_name()))
-                        .is_err()
-                {
-                    error!("Unable to remove file {:?}", entry.file_name());
-                }
-            }
-        }
-    }
-}
-
-fn print_usage() {
-    eprintln!("Usage: sn_fs <mountpoint_path>");
 }
