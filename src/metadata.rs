@@ -10,13 +10,15 @@
 use log::warn;
 use std::ffi::{OsStr, OsString};
 //use std::iter;
-use time::Timespec; // unix specific.
+use time::OffsetDateTime;
+
+use serde::{Serialize, Deserialize};
 
 // Note:  here is a useful article about FileSystem attributes
 //        by OS:   https://en.wikipedia.org/wiki/File_attribute
 
 /// Represents Inode attributes that are Posix specific.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 pub struct FsInodePosix {
     pub perm: u16,
     pub uid: u32,
@@ -25,7 +27,7 @@ pub struct FsInodePosix {
 }
 
 /// Represents Inode attributes that are Windows specific.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FsInodeWindows {
     pub archive: bool,
     pub hidden: bool,
@@ -46,7 +48,7 @@ pub struct FsInodeWindows {
 ///  a file created on Linux, BSD or Mac would have Posix attributes.
 ///  a file created on Windows would have Windows attributes
 ///  a file created directly on the Safe network (eg via API) would not have any OS attributes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FsInodeOs {
     Posix(FsInodePosix),
     #[allow(dead_code)]
@@ -56,25 +58,25 @@ pub enum FsInodeOs {
 }
 
 /// inode attributes that are common to symlinks, files, directories.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FsInodeCommon {
     pub size: u64,
-    pub mtime: Timespec,  // modified time. (file contents changed)
-    pub ctime: Timespec,  // changed time.  (metadata changed)
-    pub crtime: Timespec, // created time.
+    pub mtime: OffsetDateTime,  // modified time. (file contents changed)
+    pub ctime: OffsetDateTime,  // changed time.  (metadata changed)
+    pub crtime: OffsetDateTime, // created time.
     pub links: u32,
     pub osattrs: FsInodeOs,
 }
 
 /// inode attributes for Directories
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FsInodeDirectory {
     pub common: FsInodeCommon,
     pub name: OsString,
 }
 
 /// inode attributes for Symlinks
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FsInodeSymlink {
     pub common: FsInodeCommon,
     pub name: OsString,
@@ -82,7 +84,7 @@ pub struct FsInodeSymlink {
 }
 
 /// inode attributes for Files
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FsInodeFile {
     pub common: FsInodeCommon,
     // public xorname;   In the future, we expect to store file content in SafeNetwork, referenced by XorName.
@@ -90,7 +92,7 @@ pub struct FsInodeFile {
 }
 
 /// inode attributes for File References.   (hard links)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FsRefFile {
     pub name: OsString,
     pub inode_id: u64, // for looking up FsInodeFile under /inodefiles
@@ -106,7 +108,7 @@ pub enum DirentKind {
 
 /// enum possible kinds of metadata that can be stored in a TreeNode.
 /// In pther words, each node in the tree stores metadata of type FsMetadata.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FsMetadata {
     InodeDirectory(FsInodeDirectory),
     InodeSymlink(FsInodeSymlink),
@@ -193,19 +195,19 @@ impl FsMetadata {
         }
     }
 
-    pub fn mtime(&self) -> Timespec {
+    pub fn mtime(&self) -> OffsetDateTime {
         match self {
             Self::InodeDirectory(m) => m.common.mtime,
             Self::InodeSymlink(m) => m.common.mtime,
             Self::InodeFile(m) => m.common.mtime,
             _ => {
                 warn!("mtime not supported for {:?}", self);
-                time::empty_tm().to_timespec()
+                OffsetDateTime::unix_epoch()
             }
         }
     }
 
-    pub fn set_mtime(&mut self, ts: Timespec) {
+    pub fn set_mtime(&mut self, ts: OffsetDateTime) {
         match self {
             Self::InodeDirectory(m) => {
                 m.common.mtime = ts;
@@ -222,19 +224,19 @@ impl FsMetadata {
         }
     }
 
-    pub fn ctime(&self) -> Timespec {
+    pub fn ctime(&self) -> OffsetDateTime {
         match self {
             Self::InodeDirectory(m) => m.common.mtime,
             Self::InodeSymlink(m) => m.common.mtime,
             Self::InodeFile(m) => m.common.mtime,
             _ => {
                 warn!("ctime not supported for {:?}", self);
-                time::empty_tm().to_timespec()
+                OffsetDateTime::unix_epoch()
             }
         }
     }
 
-    pub fn set_ctime(&mut self, ts: Timespec) {
+    pub fn set_ctime(&mut self, ts: OffsetDateTime) {
         match self {
             Self::InodeDirectory(m) => {
                 m.common.ctime = ts;
@@ -251,19 +253,19 @@ impl FsMetadata {
         }
     }
 
-    pub fn crtime(&self) -> Timespec {
+    pub fn crtime(&self) -> OffsetDateTime {
         match self {
             Self::InodeDirectory(m) => m.common.crtime,
             Self::InodeSymlink(m) => m.common.crtime,
             Self::InodeFile(m) => m.common.crtime,
             _ => {
                 warn!("crtime not supported for {:?}", self);
-                time::empty_tm().to_timespec()
+                OffsetDateTime::unix_epoch()
             }
         }
     }
 
-    pub fn set_crtime(&mut self, ts: Timespec) {
+    pub fn set_crtime(&mut self, ts: OffsetDateTime) {
         match self {
             Self::InodeDirectory(m) => {
                 m.common.crtime = ts;

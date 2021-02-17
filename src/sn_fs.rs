@@ -32,9 +32,10 @@ use std::ffi::OsStr;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use time::Timespec; // unix specific.
+use time::{OffsetDateTime, Duration}; 
+use time_legacy::Timespec; // unix specific.
 
-use super::fs_tree_types::{ActorType, FsOpMove, FsTreeNode, FsTreeReplica};
+use super::fs_tree_types::{ActorType, FsOpMove, FsClock, FsTreeNode, FsTreeReplica, TreeIdType, TreeMetaType};
 
 use super::metadata::{
     DirentKind, FsInodeCommon, FsInodeDirectory, FsInodeFile, FsInodeOs, FsInodePosix,
@@ -42,10 +43,65 @@ use super::metadata::{
 };
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 }; // 1 second
+//const TTL: Timespec = fsetDateTime::from_unix_timestamp(1); // 1 second
+//const TTL = 1u64;
+
+/// Tree data store trait for sn_fs filesystem.
+pub trait FsTreeStore {
+    /// opmove
+    fn opmove(&self, parent_id: TreeIdType, meta: TreeMetaType, child_id: TreeIdType) -> FsOpMove;
+    /// apply
+    fn apply_op(&mut self, op: FsOpMove);
+    /// find
+    fn find(&self, child_id: &TreeIdType) -> Option<FsTreeNode>;
+    /// children
+    fn children(&self, parent_id: &TreeIdType) -> Vec<TreeIdType>;
+    /// time
+    fn time(&self) -> FsClock;
+    /// truncate log
+    fn truncate_log(&mut self) -> bool;
+}
+
+/// An FsTreeStore built on crdt_tree::TreeStore
+pub struct FsTreeReplicaStore(crdt_tree::TreeReplica<TreeIdType, TreeMetaType, ActorType>);
+
+impl FsTreeReplicaStore {
+    /// instantiate new FsTreeReplicaStore
+    pub fn new(actor: ActorType) -> Self {
+        Self(FsTreeReplica::new(actor))
+    }
+}
+
+impl FsTreeStore for FsTreeReplicaStore {
+    fn opmove(&self, parent_id: TreeIdType, meta: TreeMetaType, child_id: TreeIdType) -> FsOpMove {
+        self.0.opmove(parent_id, meta, child_id)
+    }
+
+    fn apply_op(&mut self, op: FsOpMove) {
+        self.0.apply_op(op)
+    }
+
+    fn find(&self, child_id: &TreeIdType) -> Option<FsTreeNode> {
+        self.0.state().tree().find(child_id).cloned()
+    }
+
+    fn children(&self, parent_id: &TreeIdType) -> Vec<TreeIdType> {
+        self.0.tree().children(parent_id)
+    }
+
+    fn time(&self) -> FsClock {
+        self.0.time().clone()
+    }
+
+    fn truncate_log(&mut self) -> bool {
+        self.0.truncate_log()
+    }
+}
+
 
 /// Safe Network File System
-pub struct SnFs {
-    replica: Arc<Mutex<FsTreeReplica>>,
+pub struct SnFs<S: FsTreeStore> {
+    replica: Arc<Mutex<S>>,
     mountpoint: Dir,
 }
 
@@ -67,7 +123,7 @@ impl InoMerge {
 }
 
 /// Some filesystem utility/helper methods.
-impl SnFs {
+impl<S: FsTreeStore> SnFs<S> {
     const FOREST: u64 = 0; // top-most node.  NOT in the tree.
     const ROOT: u64 = 1; // root of filesystem
     const FILEINODES: u64 = 2; // holds fileinodes
@@ -77,9 +133,9 @@ impl SnFs {
 
     /// returns a new SnFs instance
     #[inline]
-    pub fn new(actor: ActorType, mountpoint: Dir) -> Self {
+    pub fn new(treestore: S, mountpoint: Dir) -> Self {
         Self {
-            replica: Arc::new(Mutex::new(FsTreeReplica::new(actor))),
+            replica: Arc::new(Mutex::new(treestore)),
             mountpoint,
         }
     }
@@ -122,17 +178,16 @@ impl SnFs {
     //     matches
     // }
 
-    fn child_by_name<'r>(
+    fn child_by_name(
         &self,
-        replica: &'r FsTreeReplica,
+        replica: &S,
         parent: u64,
         name: &OsStr,
-    ) -> Option<(u64, &'r FsTreeNode)> {
-        let t = replica.state().tree();
-        for child_id in t.children(&parent) {
-            if let Some(node) = t.find(&child_id) {
+    ) -> Option<(u64, FsTreeNode)> {
+        for child_id in replica.children(&parent) {
+            if let Some(node) = replica.find(&child_id) {
                 if node.metadata().name() == name {
-                    return Some((child_id, &node));
+                    return Some((child_id, node));
                 }
             }
         }
@@ -142,7 +197,7 @@ impl SnFs {
     /// generate move operation that creates a new child node.
     fn new_opmove_new_child(
         &self,
-        replica: &FsTreeReplica,
+        replica: &S,
         parent: u64,
         metadata: FsMetadata,
     ) -> FsOpMove {
@@ -155,18 +210,18 @@ impl SnFs {
     }
 
     #[inline]
-    fn now() -> Timespec {
-        time::now().to_timespec()
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::now_utc()
     }
 
     // Verify that a given node in the tree is a directory, according to its inode metadata.
     #[inline]
-    fn verify_directory<'r>(
+    fn verify_directory(
         &self,
-        replica: &'r FsTreeReplica,
+        replica: &S,
         parent: u64,
-    ) -> Option<&'r FsTreeNode> {
-        match replica.state().tree().find(&parent) {
+    ) -> Option<FsTreeNode> {
+        match replica.find(&parent) {
             Some(node) if node.metadata().is_inode_directory() => Some(node),
             _ => None,
         }
@@ -181,10 +236,10 @@ impl SnFs {
             ino,
             size: meta.size(),
             blocks: 1,
-            atime: meta.crtime(),
-            mtime: meta.mtime(),
-            ctime: meta.ctime(),
-            crtime: meta.crtime(),
+            atime: odt_to_ts(meta.crtime()),
+            mtime: odt_to_ts(meta.mtime()),
+            ctime: odt_to_ts(meta.ctime()),
+            crtime: odt_to_ts(meta.crtime()),
             kind,
             nlink: meta.links(),
             perm: posix.perm,
@@ -197,7 +252,7 @@ impl SnFs {
 }
 
 /// Here we implement the Fuse FileSystem trait/api.
-impl Filesystem for SnFs {
+impl<S: FsTreeStore> Filesystem for SnFs<S> {
     /// Initialize filesystem. Called before any other filesystem method.
     fn init(&mut self, req: &Request) -> Result<(), c_int> {
         let mut replica = self.replica.lock().unwrap();
@@ -254,14 +309,14 @@ impl Filesystem for SnFs {
             };
 
             let mut ino = child;
-            let mut meta = node.metadata();
-
+            let mut meta: FsMetadata = node.metadata().clone();
+            
             // if inode_id() is_some() then this is a RefFile and we need to
             // dereference it to find the real File Inode.
             if let Some(inode_id) = node.metadata().inode_id() {
-                if let Some(inode) = replica.state().tree().find(&inode_id) {
+                if let Some(inode) = replica.find(&inode_id) {
                     ino = inode_id;
-                    meta = inode.metadata();
+                    meta = inode.metadata().clone();
                 }
             }
 
@@ -280,7 +335,7 @@ impl Filesystem for SnFs {
         let replica = self.replica.lock().unwrap();
 
         // Find node in tree
-        if let Some(node) = replica.state().tree().find(&ino) {
+        if let Some(node) = replica.find(&ino) {
             // Determine/validate the type of FS inode.
             // Fixme: should distinguish between FsMetadata::RefFile and FsMetadata::InodeFile.
             //        as lookup() does.  We seem to get away without it because lookup already
@@ -328,7 +383,7 @@ impl Filesystem for SnFs {
         let mut replica = self.replica.lock().unwrap();
 
         // Find node in tree
-        if let Some(node) = replica.state().tree().find(&ino) {
+        if let Some(node) = replica.find(&ino) {
             // Determine/validate the type of FS inode.
             // fixme comment in getattr() applies here also.
             let kind: FileType = match node.metadata().dirent_kind() {
@@ -354,7 +409,7 @@ impl Filesystem for SnFs {
                     meta.mtime(),
                     new_mtime
                 );
-                meta.set_mtime(new_mtime);
+                meta.set_mtime(ts_to_odt(new_mtime));
             }
             // crtime
             if let Some(new_crtime) = crtime {
@@ -363,7 +418,7 @@ impl Filesystem for SnFs {
                     meta.crtime(),
                     new_crtime
                 );
-                meta.set_crtime(new_crtime);
+                meta.set_crtime(ts_to_odt(new_crtime));
             }
             // ctime
             if let Some(new_ctime) = ctime {
@@ -372,7 +427,7 @@ impl Filesystem for SnFs {
                     meta.ctime(),
                     new_ctime
                 );
-                meta.set_ctime(new_ctime);
+                meta.set_ctime(ts_to_odt(new_ctime));
             }
 
             // size
@@ -485,7 +540,7 @@ impl Filesystem for SnFs {
             }
 
             // directory must be empty.
-            let children = replica.state().tree().children(&ino);
+            let children = replica.children(&ino);
             if !children.is_empty() {
                 reply.error(ENOTEMPTY);
                 return;
@@ -519,7 +574,7 @@ impl Filesystem for SnFs {
         let mut replica = self.replica.lock().unwrap();
 
         // find parent node
-        if let Some(_node) = replica.state().tree().find(&parent) {
+        if let Some(_node) = replica.find(&parent) {
             // note: we do not need to check if name entry already exists
             //       because fuse does it and doesn't call symlink in that case.
 
@@ -562,7 +617,7 @@ impl Filesystem for SnFs {
         let replica = self.replica.lock().unwrap();
 
         // find parent dir (under /root/)
-        if let Some(node) = replica.state().tree().find(&ino) {
+        if let Some(node) = replica.find(&ino) {
             // Ensure this node is a symlink
             if !matches!(node.metadata().dirent_kind(), Some(DirentKind::Symlink)) {
                 debug!("readlink -- einval -- ino: {}", ino);
@@ -682,9 +737,9 @@ impl Filesystem for SnFs {
         let replica = self.replica.lock().unwrap();
 
         // find children after offset.
-        let children = replica.state().tree().children(&ino);
+        let children = replica.children(&ino);
         for (i, child_ino) in children.iter().enumerate().skip(offset as usize) {
-            if let Some(node) = replica.state().tree().find(child_ino) {
+            if let Some(node) = replica.find(child_ino) {
                 let k = node.metadata().dirent_kind();
 
                 debug!("meta: {:#?}, k: {:?}", node.metadata(), k);
@@ -742,7 +797,7 @@ impl Filesystem for SnFs {
             return;
         }
 
-        if let Some(node) = replica.state().tree().find(&ino) {
+        if let Some(node) = replica.find(&ino) {
             let mut meta = node.metadata().clone();
             meta.links_inc();
 
@@ -788,7 +843,7 @@ impl Filesystem for SnFs {
                     replica.apply_op(op);
 
                     // lookup the inode. (dereference RefFile hard link)
-                    if let Some(inode) = replica.state().tree().find(&inode_id) {
+                    if let Some(inode) = replica.find(&inode_id) {
                         let mut meta = inode.metadata().clone();
                         meta.set_ctime(Self::now());
                         let cnt = meta.links_dec();
@@ -985,7 +1040,7 @@ impl Filesystem for SnFs {
         let mut replica = self.replica.lock().unwrap();
 
         // find tree node from inode_id
-        if let Some(inode) = replica.state().tree().find(&ino) {
+        if let Some(inode) = replica.find(&ino) {
             let mut meta = inode.metadata().clone();
 
             // verify we are an InodeFile
@@ -1081,7 +1136,7 @@ impl Filesystem for SnFs {
         debug!("read -- ino={}, offset={}, size={}", ino, offset, size);
         let replica = self.replica.lock().unwrap();
 
-        if let Some(inode) = replica.state().tree().find(&ino) {
+        if let Some(inode) = replica.find(&ino) {
             let meta = inode.metadata();
 
             // verify node is a InodeFile
@@ -1122,3 +1177,13 @@ impl Filesystem for SnFs {
         }
     }
 }
+
+fn ts_to_odt(ts: Timespec) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(ts.sec) + Duration::nanoseconds(ts.nsec.into())
+}
+
+fn odt_to_ts(odt: OffsetDateTime) -> Timespec {
+    let secs = odt.unix_timestamp();
+    Timespec{ sec: secs, nsec: (odt - Duration::seconds(secs)).unix_timestamp_nanos() as i32 }
+}
+

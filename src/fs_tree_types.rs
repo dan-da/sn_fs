@@ -9,13 +9,25 @@
 
 use crate::metadata::FsMetadata;
 
-/// Define some concrete types for working with crdt_tree.
+// Define some concrete types for working with crdt_tree.
 
+/// actor
 pub type ActorType = brb_membership::actor::ed25519::Actor;
+/// id
 pub type TreeIdType = u64;
+/// meta
 pub type TreeMetaType = FsMetadata;
 
+/// tree replica
 pub type FsTreeReplica = crdt_tree::TreeReplica<TreeIdType, TreeMetaType, ActorType>;
+/// state
+pub type FsState = crdt_tree::State<TreeIdType, TreeMetaType, ActorType>;
+/// opmove
 pub type FsOpMove = crdt_tree::OpMove<TreeIdType, TreeMetaType, ActorType>;
 // pub type FsLogOpMove = crdt_tree::LogOpMove<TreeIdType, TreeMetaType, ActorType>;   // for future.
+
+/// treenode
 pub type FsTreeNode = crdt_tree::TreeNode<TreeIdType, TreeMetaType>;
+
+/// clock
+pub type FsClock = crdt_tree::Clock<ActorType>;

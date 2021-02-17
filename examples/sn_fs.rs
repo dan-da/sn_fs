@@ -11,7 +11,7 @@ use brb_membership::actor::ed25519::SigningActor;
 use brb_membership::SigningActor as SigningActorTrait;
 use log::error;
 use openat::{Dir, SimpleType};
-use sn_fs::SnFs;
+use sn_fs::{SnFs, FsTreeReplicaStore};
 use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -51,8 +51,10 @@ fn main() {
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
 
+    let replica = FsTreeReplicaStore::new(actor);
+
     // mount the filesystem.
-    if let Err(e) = fuse::mount(SnFs::new(actor, mountpoint_fd), &mountpoint, &options) {
+    if let Err(e) = fuse::mount(SnFs::<FsTreeReplicaStore>::new(replica, mountpoint_fd), &mountpoint, &options) {
         eprintln!("Mount failed.  {:?}", e);
         return;
     }

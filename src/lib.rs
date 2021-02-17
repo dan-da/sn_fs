@@ -33,7 +33,9 @@
 #![deny(missing_docs)]
 
 mod sn_fs;
-pub use self::sn_fs::SnFs;
+pub use self::sn_fs::{SnFs, FsTreeStore, FsTreeReplicaStore};
 
 mod fs_tree_types;
+pub use self::fs_tree_types::{FsOpMove, TreeIdType, TreeMetaType, ActorType, FsClock, FsState, FsTreeNode};
+
 mod metadata;
