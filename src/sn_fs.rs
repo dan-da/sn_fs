@@ -103,6 +103,7 @@ impl FsTreeStore for FsTreeReplicaStore {
 pub struct SnFs<S: FsTreeStore> {
     replica: Arc<Mutex<S>>,
     mountpoint: Dir,
+    file_content_on_disk: bool,
 }
 
 struct InoMerge;
@@ -133,10 +134,11 @@ impl<S: FsTreeStore> SnFs<S> {
 
     /// returns a new SnFs instance
     #[inline]
-    pub fn new(treestore: S, mountpoint: Dir) -> Self {
+    pub fn new(treestore: S, mountpoint: Dir, file_content_on_disk: bool) -> Self {
         Self {
             replica: Arc::new(Mutex::new(treestore)),
             mountpoint,
+            file_content_on_disk: file_content_on_disk,
         }
     }
 
@@ -438,20 +440,26 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
                         meta.size(),
                         new_size
                     );
-                    // update content on disk.
-                    let file = match self
-                        .mountpoint
-                        .update_file(&ino.to_string(), Self::INO_FILE_PERM)
-                    {
-                        Ok(f) => f,
-                        Err(_) => {
+                    if self.file_content_on_disk {
+                        // update content on disk.
+                        let file = match self
+                            .mountpoint
+                            .update_file(&ino.to_string(), Self::INO_FILE_PERM)
+                        {
+                            Ok(f) => f,
+                            Err(_) => {
+                                reply.error(EINVAL);
+                                return;
+                            }
+                        };
+                        if file.set_len(new_size).is_err() {
                             reply.error(EINVAL);
                             return;
                         }
-                    };
-                    if file.set_len(new_size).is_err() {
-                        reply.error(EINVAL);
-                        return;
+                    } else {
+                        let mut new_content = meta.content().unwrap().to_vec();
+                        new_content.resize(new_size as usize, 0);
+                        meta.set_content(&new_content);
                     }
                     meta.set_size(new_size);
                 } else {
@@ -928,21 +936,24 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
                     flags,
                 }),
             },
+            content: Vec::new(),
         };
         let meta = FsMetadata::InodeFile(file_inode_meta);
 
         let op = self.new_opmove_new_child(&replica, Self::fileinodes(), meta.clone());
         let inode_id = *op.child_id();
 
-        // create file on disk.
-        if self
-            .mountpoint
-            .write_file(&inode_id.to_string(), Self::INO_FILE_PERM)
-            .is_err()
-        {
-            reply.error(EINVAL);
-            return;
-        };
+        if self.file_content_on_disk {
+            // create file on disk.
+            if self
+                .mountpoint
+                .write_file(&inode_id.to_string(), Self::INO_FILE_PERM)
+                .is_err()
+            {
+                reply.error(EINVAL);
+                return;
+            };
+        }
 
         replica.apply_op(op);
 
@@ -1052,30 +1063,38 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
             debug!("write -- found metadata: {:?}", meta);
             let old_size = meta.size();
 
-            // open "real" file on disk for update (or create)
-            let mut file = match self
-                .mountpoint
-                .update_file(&ino.to_string(), Self::INO_FILE_PERM)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("write -- can't open passthrough file {}: {:?}", ino, e);
+            let size = if self.file_content_on_disk {
+                // open "real" file on disk for update (or create)
+                let mut file = match self
+                    .mountpoint
+                    .update_file(&ino.to_string(), Self::INO_FILE_PERM)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("write -- can't open passthrough file {}: {:?}", ino, e);
+                        reply.error(EINVAL);
+                        return;
+                    }
+                };
+                if file.seek(SeekFrom::Start(offset as u64)).is_err() || file.write(data).is_err() {
                     reply.error(EINVAL);
                     return;
                 }
+                let size = match file.metadata() {
+                    Ok(m) => m.len(),
+                    Err(_) => {
+                        reply.error(EINVAL);
+                        return;
+                    }
+                };
+                size
+            } else {
+                let c = &mut meta.content().unwrap().to_vec();
+                c.append(&mut Vec::<u8>::from(data));
+                meta.set_content(&c);
+                meta.size() + data.len() as u64
             };
-            if file.seek(SeekFrom::Start(offset as u64)).is_err() || file.write(data).is_err() {
-                reply.error(EINVAL);
-                return;
-            }
 
-            let size = match file.metadata() {
-                Ok(m) => m.len(),
-                Err(_) => {
-                    reply.error(EINVAL);
-                    return;
-                }
-            };
             // increase filesize if necessary.
             if size > old_size {
                 meta.set_size(size);
@@ -1145,31 +1164,47 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
                 return;
             }
 
-            // open file
-            let mut file = match self.mountpoint.open_file(&ino.to_string()) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("read -- can't open passthrough file {}: {:?}", ino, e);
+            if self.file_content_on_disk {
+
+                // open file
+                let mut file = match self.mountpoint.open_file(&ino.to_string()) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("read -- can't open passthrough file {}: {:?}", ino, e);
+                        reply.error(EINVAL);
+                        return;
+                    }
+                };
+
+                // seek to position
+                if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                     reply.error(EINVAL);
                     return;
                 }
-            };
 
-            // seek to position
-            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                reply.error(EINVAL);
-                return;
-            }
+                // read data and return it.
+                let mut buf = vec![0; size as usize];
+                let result = file.read(&mut buf);
 
-            // read data and return it.
-            let mut buf = vec![0; size as usize];
-            let result = file.read(&mut buf);
-
-            if let Ok(_bytes_read) = result {
-                reply.data(&buf);
+                if let Ok(_bytes_read) = result {
+                    reply.data(&buf);
+                } else {
+                    error!("read -- content not found");
+                    reply.error(ENOENT);
+                }
             } else {
-                error!("read -- content not found");
-                reply.error(ENOENT);
+
+                let bytes = meta.content().unwrap();
+                let o = offset as usize;
+                let b = if size as usize > bytes.len()  {
+                     &bytes[o .. bytes.len()]
+                } else {
+                    &bytes[o .. o + size as usize]
+                };
+                let mut buf = Vec::<u8>::from(b);
+                buf.resize(size as usize, 0);
+
+                reply.data(&buf);
             }
         } else {
             error!("read -- inode not found");

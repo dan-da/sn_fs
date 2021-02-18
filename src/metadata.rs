@@ -88,7 +88,7 @@ pub struct FsInodeSymlink {
 pub struct FsInodeFile {
     pub common: FsInodeCommon,
     // public xorname;   In the future, we expect to store file content in SafeNetwork, referenced by XorName.
-    // pub content: SparseBuf,
+    pub content: Vec<u8>,   // rle_vec::RleVec<u8>,
 }
 
 /// inode attributes for File References.   (hard links)
@@ -148,6 +148,13 @@ impl FsMetadata {
             Self::InodeSymlink(m) => &m.name,
             Self::RefFile(m) => &m.name,
             _ => &OsStr::new(""),
+        }
+    }
+
+    pub fn content(&self) -> Option<&[u8]> {
+        match self {
+            Self::InodeFile(m) => Some(&m.content),
+            _ => None,
         }
     }
 
@@ -307,6 +314,15 @@ impl FsMetadata {
             Self::RefFile(m) => m.name = name.to_os_string(),
             _ => {
                 warn!("name not supported for {:?}", self);
+            }
+        }
+    }
+
+    pub fn set_content(&mut self, content: &[u8]) {
+        match self {
+            Self::InodeFile(m) => m.content = Vec::<u8>::from(content),
+            _ => {
+                warn!("content not supported for {:?}", self);
             }
         }
     }

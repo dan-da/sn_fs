@@ -54,7 +54,9 @@ fn main() {
     let replica = FsTreeReplicaStore::new(actor);
 
     // mount the filesystem.
-    if let Err(e) = fuse::mount(SnFs::<FsTreeReplicaStore>::new(replica, mountpoint_fd), &mountpoint, &options) {
+    let filecontent_on_disk = false;
+    let snfs = SnFs::<FsTreeReplicaStore>::new(replica, mountpoint_fd, filecontent_on_disk);
+    if let Err(e) = fuse::mount(snfs, &mountpoint, &options) {
         eprintln!("Mount failed.  {:?}", e);
         return;
     }
