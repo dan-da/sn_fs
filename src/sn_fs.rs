@@ -1195,10 +1195,11 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
             } else {
                 let bytes = meta.content().unwrap();
                 let o = offset as usize;
-                let b = if size as usize > bytes.len() {
+                let end = o + size as usize;
+                let b = if end > bytes.len() {
                     &bytes[o..bytes.len()]
                 } else {
-                    &bytes[o..o + size as usize]
+                    &bytes[o..end]
                 };
                 let mut buf = Vec::<u8>::from(b);
                 buf.resize(size as usize, 0);
