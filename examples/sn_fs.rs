@@ -11,7 +11,7 @@ use brb_membership::actor::ed25519::SigningActor;
 use brb_membership::SigningActor as SigningActorTrait;
 use log::error;
 use openat::{Dir, SimpleType};
-use sn_fs::{SnFs, FsTreeReplicaStore};
+use sn_fs::{FsTreeReplicaStore, SnFs};
 use std::env;
 use std::ffi::OsStr;
 use std::path::Path;

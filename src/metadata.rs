@@ -10,9 +10,41 @@
 use log::warn;
 use std::ffi::{OsStr, OsString};
 //use std::iter;
+use std::fmt;
 use time::OffsetDateTime;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+
+/// A version of OffsetDateTime that displays nicely in Debug output.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Copy)]
+pub struct FsOffsetDateTime(OffsetDateTime);
+
+impl From<OffsetDateTime> for FsOffsetDateTime {
+    fn from(o: OffsetDateTime) -> Self {
+        Self(o)
+    }
+}
+
+impl Into<OffsetDateTime> for FsOffsetDateTime {
+    fn into(self) -> OffsetDateTime {
+        self.0
+    }
+}
+
+impl fmt::Display for FsOffsetDateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.format("%F %r %z"))
+    }
+}
+
+impl fmt::Debug for FsOffsetDateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.format("%F %r %z"))
+        // f.debug_struct("FsOffsetDateTime")
+        //  .field("0", &self.0.format("%F %r %z"))
+        //  .finish()
+    }
+}
 
 // Note:  here is a useful article about FileSystem attributes
 //        by OS:   https://en.wikipedia.org/wiki/File_attribute
@@ -61,9 +93,9 @@ pub enum FsInodeOs {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FsInodeCommon {
     pub size: u64,
-    pub mtime: OffsetDateTime,  // modified time. (file contents changed)
-    pub ctime: OffsetDateTime,  // changed time.  (metadata changed)
-    pub crtime: OffsetDateTime, // created time.
+    pub mtime: FsOffsetDateTime, // modified time. (file contents changed)
+    pub ctime: FsOffsetDateTime, // changed time.  (metadata changed)
+    pub crtime: FsOffsetDateTime, // created time.
     pub links: u32,
     pub osattrs: FsInodeOs,
 }
@@ -88,7 +120,7 @@ pub struct FsInodeSymlink {
 pub struct FsInodeFile {
     pub common: FsInodeCommon,
     // public xorname;   In the future, we expect to store file content in SafeNetwork, referenced by XorName.
-    pub content: Vec<u8>,   // rle_vec::RleVec<u8>,
+    pub content: Vec<u8>, // this is temporary. it's super inefficient to store file content in metadata.
 }
 
 /// inode attributes for File References.   (hard links)
@@ -204,9 +236,9 @@ impl FsMetadata {
 
     pub fn mtime(&self) -> OffsetDateTime {
         match self {
-            Self::InodeDirectory(m) => m.common.mtime,
-            Self::InodeSymlink(m) => m.common.mtime,
-            Self::InodeFile(m) => m.common.mtime,
+            Self::InodeDirectory(m) => m.common.mtime.into(),
+            Self::InodeSymlink(m) => m.common.mtime.into(),
+            Self::InodeFile(m) => m.common.mtime.into(),
             _ => {
                 warn!("mtime not supported for {:?}", self);
                 OffsetDateTime::unix_epoch()
@@ -217,13 +249,13 @@ impl FsMetadata {
     pub fn set_mtime(&mut self, ts: OffsetDateTime) {
         match self {
             Self::InodeDirectory(m) => {
-                m.common.mtime = ts;
+                m.common.mtime = ts.into();
             }
             Self::InodeSymlink(m) => {
-                m.common.mtime = ts;
+                m.common.mtime = ts.into();
             }
             Self::InodeFile(m) => {
-                m.common.mtime = ts;
+                m.common.mtime = ts.into();
             }
             _ => {
                 warn!("mtime not supported for {:?}", self);
@@ -233,9 +265,9 @@ impl FsMetadata {
 
     pub fn ctime(&self) -> OffsetDateTime {
         match self {
-            Self::InodeDirectory(m) => m.common.mtime,
-            Self::InodeSymlink(m) => m.common.mtime,
-            Self::InodeFile(m) => m.common.mtime,
+            Self::InodeDirectory(m) => m.common.mtime.into(),
+            Self::InodeSymlink(m) => m.common.mtime.into(),
+            Self::InodeFile(m) => m.common.mtime.into(),
             _ => {
                 warn!("ctime not supported for {:?}", self);
                 OffsetDateTime::unix_epoch()
@@ -246,13 +278,13 @@ impl FsMetadata {
     pub fn set_ctime(&mut self, ts: OffsetDateTime) {
         match self {
             Self::InodeDirectory(m) => {
-                m.common.ctime = ts;
+                m.common.ctime = ts.into();
             }
             Self::InodeSymlink(m) => {
-                m.common.ctime = ts;
+                m.common.ctime = ts.into();
             }
             Self::InodeFile(m) => {
-                m.common.ctime = ts;
+                m.common.ctime = ts.into();
             }
             _ => {
                 warn!("ctime not supported for {:?}", self);
@@ -262,9 +294,9 @@ impl FsMetadata {
 
     pub fn crtime(&self) -> OffsetDateTime {
         match self {
-            Self::InodeDirectory(m) => m.common.crtime,
-            Self::InodeSymlink(m) => m.common.crtime,
-            Self::InodeFile(m) => m.common.crtime,
+            Self::InodeDirectory(m) => m.common.crtime.into(),
+            Self::InodeSymlink(m) => m.common.crtime.into(),
+            Self::InodeFile(m) => m.common.crtime.into(),
             _ => {
                 warn!("crtime not supported for {:?}", self);
                 OffsetDateTime::unix_epoch()
@@ -275,13 +307,13 @@ impl FsMetadata {
     pub fn set_crtime(&mut self, ts: OffsetDateTime) {
         match self {
             Self::InodeDirectory(m) => {
-                m.common.crtime = ts;
+                m.common.crtime = ts.into();
             }
             Self::InodeSymlink(m) => {
-                m.common.crtime = ts;
+                m.common.crtime = ts.into();
             }
             Self::InodeFile(m) => {
-                m.common.crtime = ts;
+                m.common.crtime = ts.into();
             }
             _ => {
                 warn!("crtime not supported for {:?}", self);

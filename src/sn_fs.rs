@@ -32,10 +32,12 @@ use std::ffi::OsStr;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use time::{OffsetDateTime, Duration}; 
+use time::{Duration, OffsetDateTime};
 use time_legacy::Timespec; // unix specific.
 
-use super::fs_tree_types::{ActorType, FsOpMove, FsClock, FsTreeNode, FsTreeReplica, TreeIdType, TreeMetaType};
+use super::fs_tree_types::{
+    ActorType, FsClock, FsOpMove, FsTreeNode, FsTreeReplica, TreeIdType, TreeMetaType,
+};
 
 use super::metadata::{
     DirentKind, FsInodeCommon, FsInodeDirectory, FsInodeFile, FsInodeOs, FsInodePosix,
@@ -43,26 +45,28 @@ use super::metadata::{
 };
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 }; // 1 second
-//const TTL: Timespec = fsetDateTime::from_unix_timestamp(1); // 1 second
-//const TTL = 1u64;
 
 /// Tree data store trait for sn_fs filesystem.
 pub trait FsTreeStore {
-    /// opmove
+    /// generates a tree opmove
     fn opmove(&self, parent_id: TreeIdType, meta: TreeMetaType, child_id: TreeIdType) -> FsOpMove;
-    /// apply
+    /// generates mulitple tree opmoves, in sequence.
+    fn opmoves(&self, ops: Vec<(TreeIdType, TreeMetaType, TreeIdType)>) -> Vec<FsOpMove>;
+    /// applies a single op
     fn apply_op(&mut self, op: FsOpMove);
-    /// find
+    /// applies a list of ops
+    fn apply_ops(&mut self, ops: Vec<FsOpMove>);
+    /// finds tree node that matches child_id
     fn find(&self, child_id: &TreeIdType) -> Option<FsTreeNode>;
-    /// children
+    /// returns child IDs of parent_id
     fn children(&self, parent_id: &TreeIdType) -> Vec<TreeIdType>;
-    /// time
+    /// returns current timestamp/clock
     fn time(&self) -> FsClock;
-    /// truncate log
+    /// truncates tree log
     fn truncate_log(&mut self) -> bool;
 }
 
-/// An FsTreeStore built on crdt_tree::TreeStore
+/// An FsTreeStore built on crdt_tree::TreeReplica
 pub struct FsTreeReplicaStore(crdt_tree::TreeReplica<TreeIdType, TreeMetaType, ActorType>);
 
 impl FsTreeReplicaStore {
@@ -77,8 +81,16 @@ impl FsTreeStore for FsTreeReplicaStore {
         self.0.opmove(parent_id, meta, child_id)
     }
 
+    fn opmoves(&self, op_tuples: Vec<(TreeIdType, TreeMetaType, TreeIdType)>) -> Vec<FsOpMove> {
+        self.0.opmoves(op_tuples)
+    }
+
     fn apply_op(&mut self, op: FsOpMove) {
         self.0.apply_op(op)
+    }
+
+    fn apply_ops(&mut self, ops: Vec<FsOpMove>) {
+        self.0.apply_ops(ops)
     }
 
     fn find(&self, child_id: &TreeIdType) -> Option<FsTreeNode> {
@@ -97,7 +109,6 @@ impl FsTreeStore for FsTreeReplicaStore {
         self.0.truncate_log()
     }
 }
-
 
 /// Safe Network File System
 pub struct SnFs<S: FsTreeStore> {
@@ -138,7 +149,7 @@ impl<S: FsTreeStore> SnFs<S> {
         Self {
             replica: Arc::new(Mutex::new(treestore)),
             mountpoint,
-            file_content_on_disk: file_content_on_disk,
+            file_content_on_disk,
         }
     }
 
@@ -166,26 +177,7 @@ impl<S: FsTreeStore> SnFs<S> {
         Self::TRASH
     }
 
-    // Get child of a directory by name.
-    // fn children_with_name(&self, parent: u64, name: &OsStr) -> Result<Vec<(u64, &FsTreeNode)>> {
-    //     let mut matches = Vec<(u64, FsTreeNode)>;
-    //     let t = replica.state().tree();
-    //     for child_id in t.children(&parent) {
-    //         if let Some(node) = t.find(&child_id) {
-    //             if node.metadata().name() == name {
-    //                 matches.push( (child_id, &node);
-    //             }
-    //         }
-    //     }
-    //     matches
-    // }
-
-    fn child_by_name(
-        &self,
-        replica: &S,
-        parent: u64,
-        name: &OsStr,
-    ) -> Option<(u64, FsTreeNode)> {
+    fn child_by_name(&self, replica: &S, parent: u64, name: &OsStr) -> Option<(u64, FsTreeNode)> {
         for child_id in replica.children(&parent) {
             if let Some(node) = replica.find(&child_id) {
                 if node.metadata().name() == name {
@@ -197,18 +189,24 @@ impl<S: FsTreeStore> SnFs<S> {
     }
 
     /// generate move operation that creates a new child node.
-    fn new_opmove_new_child(
+    fn new_opmove_tuple_new_child(
         &self,
-        replica: &S,
+        time: &FsClock,
         parent: u64,
         metadata: FsMetadata,
-    ) -> FsOpMove {
-        let ts = replica.time().inc();
+    ) -> (u64, FsMetadata, u64) {
         let mut hasher = Hasher64::new();
-        (*ts.actor_id()).hash(&mut hasher);
+        (*time.actor_id()).hash(&mut hasher);
         let actor_hashed = hasher.finish();
-        let child = InoMerge::combine(actor_hashed, ts.counter());
-        FsOpMove::new(ts, parent, metadata, child)
+        let child = InoMerge::combine(actor_hashed, time.counter());
+        (parent, metadata, child)
+    }
+
+    /// generate move operation that creates a new child node.
+    fn new_opmove_new_child(&self, replica: &S, parent: u64, metadata: FsMetadata) -> FsOpMove {
+        let time = replica.time().inc();
+        let tuple = self.new_opmove_tuple_new_child(&time, parent, metadata);
+        FsOpMove::new(time, tuple.0, tuple.1, tuple.2)
     }
 
     #[inline]
@@ -218,11 +216,7 @@ impl<S: FsTreeStore> SnFs<S> {
 
     // Verify that a given node in the tree is a directory, according to its inode metadata.
     #[inline]
-    fn verify_directory(
-        &self,
-        replica: &S,
-        parent: u64,
-    ) -> Option<FsTreeNode> {
+    fn verify_directory(&self, replica: &S, parent: u64) -> Option<FsTreeNode> {
         match replica.find(&parent) {
             Some(node) if node.metadata().is_inode_directory() => Some(node),
             _ => None,
@@ -265,9 +259,9 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
             common: FsInodeCommon {
                 size: 0,
                 links: 1,
-                ctime: Self::now(),
-                crtime: Self::now(),
-                mtime: Self::now(),
+                ctime: Self::now().into(),
+                crtime: Self::now().into(),
+                mtime: Self::now().into(),
                 osattrs: FsInodeOs::Posix(FsInodePosix {
                     perm: 0o744,
                     uid: req.uid(),
@@ -312,7 +306,7 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
 
             let mut ino = child;
             let mut meta: FsMetadata = node.metadata().clone();
-            
+
             // if inode_id() is_some() then this is a RefFile and we need to
             // dereference it to find the real File Inode.
             if let Some(inode_id) = node.metadata().inode_id() {
@@ -593,9 +587,9 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
                 common: FsInodeCommon {
                     size: 0,
                     links: 1,
-                    ctime: Self::now(),
-                    crtime: Self::now(),
-                    mtime: Self::now(),
+                    ctime: Self::now().into(),
+                    crtime: Self::now().into(),
+                    mtime: Self::now().into(),
                     osattrs: FsInodeOs::Posix(FsInodePosix {
                         perm: 0o777,
                         uid: req.uid(),
@@ -701,9 +695,9 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
             common: FsInodeCommon {
                 size: 0,
                 links: 1,
-                ctime: Self::now(),
-                crtime: Self::now(),
-                mtime: Self::now(),
+                ctime: Self::now().into(),
+                crtime: Self::now().into(),
+                mtime: Self::now().into(),
                 osattrs: FsInodeOs::Posix(FsInodePosix {
                     perm: mode as u16,
                     uid: req.uid(),
@@ -925,9 +919,9 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
         let file_inode_meta = FsInodeFile {
             common: FsInodeCommon {
                 size: 0,
-                ctime: Self::now(),
-                crtime: Self::now(),
-                mtime: Self::now(),
+                ctime: Self::now().into(),
+                crtime: Self::now().into(),
+                mtime: Self::now().into(),
                 links: 1,
                 osattrs: FsInodeOs::Posix(FsInodePosix {
                     perm: 0o644,
@@ -940,8 +934,12 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
         };
         let meta = FsMetadata::InodeFile(file_inode_meta);
 
-        let op = self.new_opmove_new_child(&replica, Self::fileinodes(), meta.clone());
-        let inode_id = *op.child_id();
+        let mut op_tuples = vec![];
+
+        let mut time = replica.time();
+        let op = self.new_opmove_tuple_new_child(&time.tick(), Self::fileinodes(), meta.clone());
+        let inode_id = op.2;
+        op_tuples.push(op);
 
         if self.file_content_on_disk {
             // create file on disk.
@@ -955,8 +953,6 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
             };
         }
 
-        replica.apply_op(op);
-
         // create tree entry under /root/../parent_id
         let file_ref_meta = FsRefFile {
             name: name.to_os_string(),
@@ -965,9 +961,13 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
 
         // Here we create the RefFile hard link to the InodeFile created above.
         let meta_ref = FsMetadata::RefFile(file_ref_meta);
-        let op_ref = self.new_opmove_new_child(&replica, parent, meta_ref);
-        let ref_id = *op_ref.child_id();
-        replica.apply_op(op_ref);
+        let op_ref = self.new_opmove_tuple_new_child(&time.tick(), parent, meta_ref);
+        let ref_id = op_ref.2;
+        op_tuples.push(op_ref);
+
+        let ops = replica.opmoves(op_tuples);
+        debug!("ops: {:?}", ops);
+        replica.apply_ops(ops);
 
         debug!(
             "create -- ref_id={}, inode_id={}, name={:?}",
@@ -1080,14 +1080,14 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
                     reply.error(EINVAL);
                     return;
                 }
-                let size = match file.metadata() {
+                // find file size
+                match file.metadata() {
                     Ok(m) => m.len(),
                     Err(_) => {
                         reply.error(EINVAL);
                         return;
                     }
-                };
-                size
+                }
             } else {
                 let c = &mut meta.content().unwrap().to_vec();
                 c.append(&mut Vec::<u8>::from(data));
@@ -1110,6 +1110,7 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
 
             reply.written(data.len() as u32);
         } else {
+            debug!("write -- ino not found.  ({})", ino);
             reply.error(ENOENT);
         }
     }
@@ -1165,7 +1166,6 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
             }
 
             if self.file_content_on_disk {
-
                 // open file
                 let mut file = match self.mountpoint.open_file(&ino.to_string()) {
                     Ok(f) => f,
@@ -1193,13 +1193,12 @@ impl<S: FsTreeStore> Filesystem for SnFs<S> {
                     reply.error(ENOENT);
                 }
             } else {
-
                 let bytes = meta.content().unwrap();
                 let o = offset as usize;
-                let b = if size as usize > bytes.len()  {
-                     &bytes[o .. bytes.len()]
+                let b = if size as usize > bytes.len() {
+                    &bytes[o..bytes.len()]
                 } else {
-                    &bytes[o .. o + size as usize]
+                    &bytes[o..o + size as usize]
                 };
                 let mut buf = Vec::<u8>::from(b);
                 buf.resize(size as usize, 0);
@@ -1219,6 +1218,8 @@ fn ts_to_odt(ts: Timespec) -> OffsetDateTime {
 
 fn odt_to_ts(odt: OffsetDateTime) -> Timespec {
     let secs = odt.unix_timestamp();
-    Timespec{ sec: secs, nsec: (odt - Duration::seconds(secs)).unix_timestamp_nanos() as i32 }
+    Timespec {
+        sec: secs,
+        nsec: (odt - Duration::seconds(secs)).unix_timestamp_nanos() as i32,
+    }
 }
-
